@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import sys
+import argparse
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms
+import clip
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_image(path, size=224):
+    img = Image.open(path).convert("RGB")
+    tensor = transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+    ])(img).unsqueeze(0)
+    return tensor, img.size
+
+
+def generate_protection(image_tensor, model, steps=50, epsilon=8/255, lr=0.01):
+    device = next(model.parameters()).device
+    image_tensor = image_tensor.to(device)
+    
+    with torch.no_grad():
+        original_features = model.encode_image(image_tensor)
+    
+    delta = torch.zeros_like(image_tensor, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=lr)
+    
+    print(f"Generating protection ({steps} steps)...")
+    
+    for i in range(steps):
+        perturbed = torch.clamp(image_tensor + delta, 0, 1)
+        features = model.encode_image(perturbed)
+        loss = F.cosine_similarity(features, original_features).mean()
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        delta.data = torch.clamp(delta.data, -epsilon, epsilon)
+        
+        if (i + 1) % 10 == 0:
+            print(f"  Step {i+1}/{steps} | Similarity: {loss.item():.3f}")
+    
+    return delta.detach()
+
+
+def protect_image(input_path, output_path, intensity="medium", steps=None):
+    presets = {
+        "low": {"steps": 30, "epsilon": 4/255},
+        "medium": {"steps": 50, "epsilon": 8/255},
+        "high": {"steps": 100, "epsilon": 16/255},
+    }
+    
+    config = presets.get(intensity, presets["medium"])
+    if steps:
+        config["steps"] = steps
+    
+    device = get_device()
+    print(f"Using device: {device}")
+    
+    print("Loading CLIP model...")
+    model, _ = clip.load("ViT-B/32", device=device)
+    
+    image_tensor, original_size = load_image(input_path)
+    delta = generate_protection(image_tensor, model, steps=config["steps"], epsilon=config["epsilon"])
+    
+    original = transforms.ToTensor()(Image.open(input_path).convert("RGB")).unsqueeze(0)
+    delta_scaled = F.interpolate(delta.cpu(), size=original.shape[2:], mode='bilinear', align_corners=False)
+    
+    protected = torch.clamp(original + delta_scaled, 0, 1)
+    result = transforms.ToPILImage()(protected.squeeze(0))
+    result.save(output_path, quality=95)
+    
+    print(f"✓ Protected image saved: {output_path}")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Protect artwork from AI training")
+    parser.add_argument("input", type=Path, help="Input image or directory")
+    parser.add_argument("-o", "--output", type=Path, help="Output path")
+    parser.add_argument("-i", "--intensity", choices=["low", "medium", "high"], default="medium")
+    parser.add_argument("--steps", type=int, help="Override optimization steps")
+    
+    args = parser.parse_args()
+    
+    if not args.input.exists():
+        print(f"Error: {args.input} not found")
+        sys.exit(1)
+    
+    if args.input.is_file():
+        files = [args.input]
+    else:
+        files = list(args.input.glob("*.jpg")) + list(args.input.glob("*.jpeg")) + list(args.input.glob("*.png"))
+    
+    if not files:
+        print("No images found")
+        sys.exit(1)
+    
+    if args.output and args.output.suffix == "":
+        output_dir = args.output
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir = None
+    
+    for f in files:
+        if output_dir:
+            out = output_dir / f"{f.stem}_protected{f.suffix}"
+        elif args.output:
+            out = args.output
+        else:
+            out = f.parent / f"{f.stem}_protected{f.suffix}"
+        
+        protect_image(f, out, args.intensity, args.steps)
+
+
+if __name__ == "__main__":
+    main()
